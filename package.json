@@ -1,0 +1,37 @@
+{
+  "name": "wopr-plugin-provider-openai",
+  "version": "1.0.0",
+  "description": "OpenAI Codex provider plugin for WOPR",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "wopr",
+    "wopr-plugin",
+    "provider",
+    "openai",
+    "codex"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "wopr": "^0.0.1"
+  },
+  "dependencies": {
+    "openai": "^4.104.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
+  },
+  "wopr": {
+    "plugin": {
+      "name": "provider-openai",
+      "category": "provider",
+      "description": "OpenAI Codex API for coding tasks"
+    }
+  }
+}
