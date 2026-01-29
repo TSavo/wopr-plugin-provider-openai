@@ -1,6 +1,6 @@
 {
   "name": "wopr-plugin-provider-openai",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenAI Codex provider plugin for WOPR",
   "main": "index.js",
   "type": "module",
@@ -21,7 +21,8 @@
     "wopr": "^0.0.1"
   },
   "dependencies": {
-    "openai": "^4.104.0"
+    "openai": "^4.104.0",
+    "winston": "^3.11.0"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
