@@ -1,10 +1,9 @@
 /**
- * WOPR Plugin: OpenAI Codex Provider
+ * WOPR Plugin: Codex Provider
  *
- * Provides OpenAI Codex API access via the Codex SDK.
- * Supports A2A tools via MCP server configuration.
- * Note: Vision support via image URLs in prompt (SDK vision is beta/buggy).
- * Install: wopr plugin install wopr-plugin-provider-openai
+ * Provides Codex API access via the official @openai/codex-sdk.
+ * Supports A2A tools, session resumption via thread IDs, and reasoning effort control.
+ * Install: wopr plugin install wopr-plugin-provider-codex
  */
 
 import winston from "winston";
@@ -104,7 +103,7 @@ const logger = winston.createLogger({
     winston.format.errors({ stack: true }),
     winston.format.json()
   ),
-  defaultMeta: { service: "wopr-plugin-provider-openai" },
+  defaultMeta: { service: "wopr-plugin-provider-codex" },
   transports: [
     new winston.transports.Console({ level: "warn" })
   ],
@@ -130,37 +129,27 @@ async function loadCodexSDK() {
 }
 
 /**
- * Convert A2A server configs to Codex MCP server format
- * Codex expects: { name: { command, args, env } } or { name: { url } }
+ * Map temperature (0-1) to Codex reasoning effort
+ * Lower temp = more deterministic = higher effort
  */
-function convertA2AToCodexMcpConfig(a2aServers: Record<string, A2AServerConfig>): Record<string, any> {
-  const mcpServers: Record<string, any> = {};
-
-  for (const [serverName, config] of Object.entries(a2aServers)) {
-    // For A2A servers, we create a virtual MCP config
-    // The actual tool execution is handled by WOPR's A2A system
-    mcpServers[serverName] = {
-      // Mark as WOPR-managed A2A server
-      woprA2A: true,
-      name: config.name,
-      version: config.version || "1.0.0",
-      tools: config.tools.map(t => t.name),
-    };
-    logger.info(`[codex] Registered A2A server: ${serverName} with ${config.tools.length} tools`);
-  }
-
-  return mcpServers;
+function temperatureToEffort(temp?: number): "minimal" | "low" | "medium" | "high" | "xhigh" {
+  if (temp === undefined) return "medium";
+  if (temp <= 0.2) return "xhigh";
+  if (temp <= 0.4) return "high";
+  if (temp <= 0.6) return "medium";
+  if (temp <= 0.8) return "low";
+  return "minimal";
 }
 
 /**
- * OpenAI Codex provider implementation
+ * Codex provider implementation
  */
 const codexProvider: ModelProvider = {
   id: "codex",
-  name: "OpenAI Codex",
-  description: "OpenAI Codex agent SDK with A2A/MCP support",
-  defaultModel: "codex",
-  supportedModels: ["codex"],
+  name: "Codex",
+  description: "Codex agent SDK with session resumption and A2A support",
+  defaultModel: "", // SDK chooses default
+  supportedModels: [], // Populated dynamically via listModels()
 
   async validateCredentials(credential: string): Promise<boolean> {
     // API key format: sk-... (OpenAI format)
@@ -169,12 +158,12 @@ const codexProvider: ModelProvider = {
     }
 
     try {
-      const codex = await loadCodexSDK();
-      // Create a client to validate the credential
-      const client = codex.createClient({ apiKey: credential });
-      // Try a simple health check
-      await client.health();
-      return true;
+      const { Codex } = await loadCodexSDK();
+      const codex = new Codex({ apiKey: credential });
+      // Start a minimal thread to validate
+      const thread = codex.startThread();
+      // Thread creation succeeds if credentials are valid
+      return !!thread;
     } catch (error) {
       logger.error("[codex] Credential validation failed:", error);
       return false;
@@ -194,69 +183,134 @@ const codexProvider: ModelProvider = {
 };
 
 /**
- * Codex client implementation with A2A support
+ * Codex client implementation with session resumption
  */
 class CodexClient implements ModelClient {
-  private client: any;
+  private codex: any;
 
   constructor(
     private credential: string,
     private options?: Record<string, unknown>
-  ) {
-    // Set API key for Codex SDK to use
-    process.env.OPENAI_API_KEY = credential;
-  }
+  ) {}
 
-  private async getClient() {
-    if (!this.client) {
-      const codex = await loadCodexSDK();
-      this.client = codex.createClient({
+  private async getCodex() {
+    if (!this.codex) {
+      const { Codex } = await loadCodexSDK();
+      this.codex = new Codex({
         apiKey: this.credential,
         ...this.options,
       });
     }
-    return this.client;
+    return this.codex;
   }
 
   async *query(opts: ModelQueryOptions): AsyncGenerator<unknown> {
-    const client = await this.getClient();
+    const codex = await this.getCodex();
 
     try {
-      // Prepare prompt - include image URLs in text
-      // Codex SDK vision is beta/buggy, so we include URLs in prompt instead
+      let thread: any;
+
+      // Session resumption via thread ID
+      if (opts.resume) {
+        logger.info(`[codex] Resuming thread: ${opts.resume}`);
+        thread = codex.resumeThread(opts.resume);
+      } else {
+        // Start new thread with options
+        const threadOptions: any = {
+          workingDirectory: process.cwd(),
+          sandboxMode: "workspace-write",
+          approvalPolicy: "never", // YOLO mode - auto-approve
+        };
+
+        // Model selection
+        if (opts.model) {
+          threadOptions.model = opts.model;
+        }
+
+        // Map temperature to reasoning effort
+        threadOptions.modelReasoningEffort = temperatureToEffort(opts.temperature);
+        logger.info(`[codex] Reasoning effort: ${threadOptions.modelReasoningEffort}`);
+
+        // Merge provider options
+        if (opts.providerOptions) {
+          Object.assign(threadOptions, opts.providerOptions);
+        }
+
+        thread = codex.startThread(threadOptions);
+      }
+
+      // Yield thread ID for session tracking (feature parity with Anthropic)
+      if (thread.id) {
+        yield { type: 'session_id', session_id: thread.id };
+        logger.info(`[codex] Thread ID: ${thread.id}`);
+      }
+
+      // Prepare prompt with images if provided
       let prompt = opts.prompt;
       if (opts.images && opts.images.length > 0) {
         const imageList = opts.images.map((url, i) => `[Image ${i + 1}]: ${url}`).join('\n');
         prompt = `[User has shared ${opts.images.length} image(s)]\n${imageList}\n\n${opts.prompt}`;
       }
 
-      // Build run options
-      const runOptions: any = {
-        prompt,
-        systemPrompt: opts.systemPrompt,
-        directory: process.cwd(),
-        ...opts.providerOptions,
-      };
-
-      // A2A MCP server support
-      // Codex uses mcp_servers config for MCP integration
-      if (opts.a2aServers && Object.keys(opts.a2aServers).length > 0) {
-        runOptions.mcpServers = convertA2AToCodexMcpConfig(opts.a2aServers);
-        logger.info(`[codex] A2A MCP servers configured: ${Object.keys(opts.a2aServers).join(", ")}`);
+      // Add system prompt context if provided
+      if (opts.systemPrompt) {
+        prompt = `[System: ${opts.systemPrompt}]\n\n${prompt}`;
       }
 
-      // Tools that are auto-allowed
-      if (opts.allowedTools && opts.allowedTools.length > 0) {
-        runOptions.enabledTools = opts.allowedTools;
-        logger.info(`[codex] Allowed tools: ${opts.allowedTools.join(", ")}`);
-      }
+      // Use streaming to get real-time events
+      const { events } = await thread.runStreamed(prompt);
 
-      // Use Codex agent for code execution
-      const q = await client.run(runOptions);
+      for await (const event of events) {
+        switch (event.type) {
+          case "thread.started":
+            yield { type: 'system', subtype: 'init', thread_id: event.thread_id };
+            break;
 
-      // Stream results from Codex agent
-      for await (const msg of q) {
-        yield msg;
+          case "turn.started":
+            yield { type: 'system', subtype: 'turn_start' };
+            break;
+
+          case "item.completed":
+            // Handle different item types
+            if (event.item.type === "agent_message") {
+              yield { type: 'text', text: event.item.text };
+            } else if (event.item.type === "reasoning") {
+              yield { type: 'reasoning', text: event.item.text };
+            } else if (event.item.type === "command_execution") {
+              yield {
+                type: 'tool_use',
+                name: 'bash',
+                input: { command: event.item.command },
+                output: event.item.aggregated_output,
+                exit_code: event.item.exit_code,
+              };
+            } else if (event.item.type === "file_change") {
+              yield {
+                type: 'tool_use',
+                name: 'file_change',
+                changes: event.item.changes,
+              };
+            } else if (event.item.type === "mcp_tool_call") {
+              yield {
+                type: 'tool_use',
+                name: `mcp__${event.item.server}__${event.item.tool}`,
+                status: event.item.status,
+              };
+            }
+            break;
+
+          case "turn.completed":
+            yield {
+              type: 'usage',
+              input_tokens: event.usage?.input_tokens,
+              output_tokens: event.usage?.output_tokens,
+            };
+            break;
+
+          case "turn.failed":
+            yield { type: 'error', message: event.error?.message };
+            break;
+        }
       }
     } catch (error) {
       logger.error("[codex] Query failed:", error);
@@ -267,14 +321,29 @@ class CodexClient implements ModelClient {
   }
 
   async listModels(): Promise<string[]> {
-    return codexProvider.supportedModels;
+    try {
+      const codex = await this.getCodex();
+      // Use SDK's model list endpoint
+      const response = await codex.listModels();
+      if (response?.items) {
+        return response.items.map((m: any) => m.model || m.id);
+      }
+      // Fallback if response format is different
+      if (Array.isArray(response)) {
+        return response.map((m: any) => m.model || m.id || m.name || m);
+      }
+      return [];
+    } catch (error) {
+      logger.error("[codex] Failed to list models:", error);
+      return [];
+    }
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      const client = await this.getClient();
-      await client.health();
-      return true;
+      const codex = await this.getCodex();
+      const thread = codex.startThread();
+      return !!thread;
     } catch (error) {
       logger.error("[codex] Health check failed:", error);
       return false;
@@ -286,19 +355,19 @@ class CodexClient implements ModelClient {
  * Plugin export
  */
 const plugin: WOPRPlugin = {
-  name: "provider-openai",
-  version: "1.1.0", // Bumped for A2A support
-  description: "OpenAI Codex API provider for WOPR with A2A/MCP support",
+  name: "provider-codex",
+  version: "2.0.0",
+  description: "Codex agent SDK provider for WOPR",
 
   async init(ctx: WOPRPluginContext) {
-    ctx.log.info("Registering OpenAI Codex provider...");
+    ctx.log.info("Registering Codex provider...");
     ctx.registerProvider(codexProvider);
-    ctx.log.info("OpenAI Codex provider registered (supports A2A/MCP)");
+    ctx.log.info("Codex provider registered (session resumption, reasoning effort)");
 
     // Register config schema for UI
-    ctx.registerConfigSchema("provider-openai", {
-      title: "OpenAI Codex",
-      description: "Configure OpenAI Codex API credentials",
+    ctx.registerConfigSchema("provider-codex", {
+      title: "Codex",
+      description: "Configure Codex API credentials",
       fields: [
         {
           name: "apiKey",
@@ -306,23 +375,38 @@ const plugin: WOPRPlugin = {
           label: "API Key",
           placeholder: "sk-...",
           required: true,
-          description: "Your OpenAI API key (starts with sk-)",
+          description: "Your Codex API key (starts with sk-)",
         },
         {
-          name: "organization",
+          name: "defaultModel",
           type: "text",
-          label: "Organization ID",
-          placeholder: "org-... (optional)",
+          label: "Default Model",
+          placeholder: "(uses SDK default)",
           required: false,
-          description: "Optional: OpenAI organization ID",
+          description: "Default model (leave empty for SDK default, or specify model from listModels())",
+        },
+        {
+          name: "reasoningEffort",
+          type: "select",
+          label: "Reasoning Effort",
+          required: false,
+          description: "How much effort the model puts into reasoning",
+          options: [
+            { value: "minimal", label: "Minimal (fastest)" },
+            { value: "low", label: "Low" },
+            { value: "medium", label: "Medium (default)" },
+            { value: "high", label: "High" },
+            { value: "xhigh", label: "Extra High (most thorough)" },
+          ],
+          default: "medium",
         },
       ],
     });
-    ctx.log.info("Registered OpenAI Codex config schema");
+    ctx.log.info("Registered Codex config schema");
   },
 
   async shutdown() {
-    logger.info("[provider-openai] Shutting down");
+    logger.info("[provider-codex] Shutting down");
   },
 };
 
