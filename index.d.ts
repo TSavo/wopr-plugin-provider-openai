@@ -86,6 +86,18 @@ interface WOPRPlugin {
     init(ctx: WOPRPluginContext): Promise<void>;
     shutdown(): Promise<void>;
 }
+export interface AuthMethodInfo {
+    id: string;
+    name: string;
+    description: string;
+    available: boolean;
+    requiresInput: boolean;
+    inputType?: "password" | "text";
+    inputLabel?: string;
+    inputPlaceholder?: string;
+    setupInstructions?: string[];
+    docsUrl?: string;
+}
 /**
  * Plugin export
  */

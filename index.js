@@ -6,6 +6,9 @@
  * Install: wopr plugin install wopr-plugin-provider-codex
  */
 import winston from "winston";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 // Setup winston logger
 const logger = winston.createLogger({
     level: "info",
@@ -16,6 +19,113 @@ const logger = winston.createLogger({
     ],
 });
 let CodexSDK;
+// =============================================================================
+// Auth Detection - mirrors Anthropic plugin pattern
+// =============================================================================
+const CODEX_AUTH_FILE = join(homedir(), ".codex", "auth.json");
+function loadCodexCredentials() {
+    if (!existsSync(CODEX_AUTH_FILE))
+        return null;
+    try {
+        const data = JSON.parse(readFileSync(CODEX_AUTH_FILE, "utf-8"));
+        // Check for OAuth tokens first
+        if (data.tokens?.access_token) {
+            // Parse email from id_token JWT payload
+            let email = "";
+            let planType = "";
+            try {
+                const payload = JSON.parse(Buffer.from(data.tokens.id_token.split('.')[1], 'base64').toString());
+                email = payload.email || "";
+                planType = payload["https://api.openai.com/auth"]?.chatgpt_plan_type || "";
+            }
+            catch { }
+            return {
+                type: "oauth",
+                accessToken: data.tokens.access_token,
+                refreshToken: data.tokens.refresh_token,
+                email,
+                planType,
+            };
+        }
+        // Check for API key
+        if (data.OPENAI_API_KEY) {
+            return {
+                type: "api_key",
+                apiKey: data.OPENAI_API_KEY,
+            };
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+function getApiKeyFromEnv() {
+    return process.env.OPENAI_API_KEY || null;
+}
+function getAuth() {
+    // Check Codex CLI credentials first (like Anthropic checks Claude Code)
+    const codexAuth = loadCodexCredentials();
+    if (codexAuth)
+        return codexAuth;
+    // Fall back to environment variable
+    const envKey = getApiKeyFromEnv();
+    if (envKey && envKey.startsWith("sk-")) {
+        return { type: "api_key", apiKey: envKey };
+    }
+    return null;
+}
+function hasCredentials() {
+    return getAuth() !== null;
+}
+function getAuthMethods() {
+    const codexAuth = loadCodexCredentials();
+    const envKey = getApiKeyFromEnv();
+    const hasEnvKey = !!envKey && envKey.startsWith("sk-");
+    return [
+        {
+            id: "oauth",
+            name: "ChatGPT Plus/Pro (OAuth)",
+            description: "Use your ChatGPT subscription - no per-token costs",
+            available: codexAuth?.type === "oauth",
+            requiresInput: false,
+            setupInstructions: codexAuth?.type === "oauth"
+                ? [`Logged in as: ${codexAuth.email || "ChatGPT user"} (${codexAuth.planType || "plus"})`]
+                : ["Run: codex login", "Then restart WOPR"],
+            docsUrl: "https://chatgpt.com/",
+        },
+        {
+            id: "env",
+            name: "Environment Variable",
+            description: "Use OPENAI_API_KEY from environment",
+            available: hasEnvKey,
+            requiresInput: false,
+            setupInstructions: hasEnvKey
+                ? [`Using key from OPENAI_API_KEY (${envKey.slice(0, 10)}...)`]
+                : ["Set OPENAI_API_KEY environment variable"],
+            docsUrl: "https://platform.openai.com/api-keys",
+        },
+        {
+            id: "api-key",
+            name: "API Key (manual)",
+            description: "Enter API key directly - billed per token",
+            available: true,
+            requiresInput: true,
+            inputType: "password",
+            inputLabel: "OpenAI API Key",
+            inputPlaceholder: "sk-...",
+            docsUrl: "https://platform.openai.com/api-keys",
+        },
+    ];
+}
+function getActiveAuthMethod() {
+    const auth = getAuth();
+    if (auth?.type === "oauth")
+        return "oauth";
+    if (auth?.type === "api_key")
+        return "api-key";
+    return "none";
+}
 /**
  * Lazy load Codex SDK
  */
@@ -54,10 +164,18 @@ function temperatureToEffort(temp) {
 const codexProvider = {
     id: "codex",
     name: "Codex",
-    description: "Codex agent SDK with session resumption and A2A support",
+    description: "Codex agent SDK with OAuth, API key, session resumption",
     defaultModel: "", // SDK chooses default
     supportedModels: [], // Populated dynamically via listModels()
+    // Onboarding helpers (like Anthropic)
+    getAuthMethods,
+    getActiveAuthMethod,
+    hasCredentials,
     async validateCredentials(credential) {
+        // Empty credential is valid if we have OAuth or env-based auth
+        if (!credential || credential === "") {
+            return hasCredentials();
+        }
         // API key format: sk-... (OpenAI format)
         if (!credential.startsWith("sk-")) {
             return false;
@@ -79,6 +197,9 @@ const codexProvider = {
         return new CodexClient(credential, options);
     },
     getCredentialType() {
+        const active = getActiveAuthMethod();
+        if (active === "oauth")
+            return "oauth";
         return "api-key";
     },
 };
@@ -89,17 +210,52 @@ class CodexClient {
     credential;
     options;
     codex;
+    authType;
     constructor(credential, options) {
         this.credential = credential;
         this.options = options;
+        // Determine auth type (like Anthropic client)
+        if (credential && credential.startsWith("sk-")) {
+            this.authType = "api_key";
+        }
+        else {
+            const auth = getAuth();
+            if (auth?.type === "oauth") {
+                this.authType = "oauth";
+            }
+            else if (auth?.type === "api_key") {
+                this.authType = "api_key";
+                this.credential = auth.apiKey || "";
+            }
+            else {
+                this.authType = "none";
+            }
+        }
+        logger.info(`[codex] Using auth: ${this.authType}`);
     }
     async getCodex() {
         if (!this.codex) {
             const { Codex } = await loadCodexSDK();
-            this.codex = new Codex({
-                apiKey: this.credential,
-                ...this.options,
-            });
+            const auth = getAuth();
+            if (this.authType === "oauth" && auth?.accessToken) {
+                // Use OAuth access token
+                this.codex = new Codex({
+                    accessToken: auth.accessToken,
+                    ...this.options,
+                });
+                logger.info(`[codex] Initialized with OAuth (${auth.email || "user"})`);
+            }
+            else if (this.credential) {
+                // Use API key
+                this.codex = new Codex({
+                    apiKey: this.credential,
+                    ...this.options,
+                });
+                logger.info(`[codex] Initialized with API key`);
+            }
+            else {
+                throw new Error("No valid credentials available. Run: codex login");
+            }
         }
         return this.codex;
     }
@@ -244,23 +400,49 @@ class CodexClient {
 const plugin = {
     name: "provider-codex",
     version: "2.0.0",
-    description: "Codex agent SDK provider for WOPR",
+    description: "Codex agent SDK provider with OAuth and API key support",
     async init(ctx) {
         ctx.log.info("Registering Codex provider...");
+        // Show auth status (like Anthropic)
+        const activeAuth = getActiveAuthMethod();
+        const authMethods = getAuthMethods();
+        const activeMethod = authMethods.find(m => m.id === activeAuth);
+        if (activeMethod?.available) {
+            ctx.log.info(`  Auth: ${activeMethod.name}`);
+            if (activeMethod.setupInstructions?.[0]) {
+                ctx.log.info(`  ${activeMethod.setupInstructions[0]}`);
+            }
+        }
+        else {
+            ctx.log.info("  Auth: None configured");
+            ctx.log.info("  Run: codex login (OAuth) or set OPENAI_API_KEY");
+        }
         ctx.registerProvider(codexProvider);
-        ctx.log.info("Codex provider registered (session resumption, reasoning effort)");
-        // Register config schema for UI
+        ctx.log.info("Codex provider registered");
+        // Register config schema for UI (like Anthropic)
+        const methods = getAuthMethods();
         ctx.registerConfigSchema("provider-codex", {
             title: "Codex",
-            description: "Configure Codex API credentials",
+            description: "Configure Codex authentication",
             fields: [
+                {
+                    name: "authMethod",
+                    type: "select",
+                    label: "Authentication Method",
+                    options: methods.map(m => ({
+                        value: m.id,
+                        label: `${m.name}${m.available ? " ✓" : ""}`,
+                    })),
+                    default: getActiveAuthMethod(),
+                    description: "Choose how to authenticate with Codex",
+                },
                 {
                     name: "apiKey",
                     type: "password",
                     label: "API Key",
                     placeholder: "sk-...",
-                    required: true,
-                    description: "Your Codex API key (starts with sk-)",
+                    required: false,
+                    description: "Only needed for API Key auth method",
                 },
                 {
                     name: "defaultModel",
@@ -268,7 +450,7 @@ const plugin = {
                     label: "Default Model",
                     placeholder: "(uses SDK default)",
                     required: false,
-                    description: "Default model (leave empty for SDK default, or specify model from listModels())",
+                    description: "Default model (leave empty for SDK default)",
                 },
                 {
                     name: "reasoningEffort",
@@ -287,7 +469,6 @@ const plugin = {
                 },
             ],
         });
-        ctx.log.info("Registered Codex config schema");
     },
     async shutdown() {
         logger.info("[provider-codex] Shutting down");
